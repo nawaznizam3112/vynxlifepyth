@@ -1,5 +1,4 @@
-
-streamlit
-qrcode[pil]
+streamlit>=1.40.0
 pandas
 plotly
+qrcode[pil]
