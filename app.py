@@ -976,34 +976,52 @@ with add_patient_tab:
         elif len(patient_pin) < 4:
             st.warning("Patient PIN must be at least 4 characters.")
         else:
-            token = secrets.token_urlsafe(24)
+           
+token = secrets.token_urlsafe(24)
 
-            conn = get_connection()
-            conn.execute(
-                """
-                INSERT INTO patients (
-                    doctor_id,
-                    name,
-                    age,
-                    sex,
-                    phone,
-                    qr_token,
-                    pin_hash,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    doctor_id,
-                    patient_name.strip(),
-                    int(patient_age),
-                    patient_sex,
-                    patient_phone.strip(),
-                    token,
-                    hash_secret(patient_pin),
-                    now_text(),
-                ),
-            )
+# Generate a unique patient identification code
+patient_code = "VYX-" + secrets.token_hex(4).upper()
+
+conn = get_connection()
+conn.execute(
+    """
+    INSERT INTO patients (
+        doctor_id,
+        patient_code,
+        name,
+        age,
+        sex,
+        phone,
+        qr_token,
+        pin_hash,
+        created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    (
+        doctor_id,
+        patient_code,
+        patient_name.strip(),
+        int(patient_age),
+        patient_sex,
+        patient_phone.strip(),
+        token,
+        hash_secret(patient_pin),
+        now_text(),
+    ),
+)
+conn.commit()
+conn.close()
+
+st.success("Patient registered successfully.")
+st.write(f"Patient ID: **{patient_code}**")
+st.info(
+    "Set the deployed app URL below to create the patient's QR code."
+)
+
+st.session_state["new_patient_token"] = token
+st.session_state["new_patient_name"] = patient_name.strip()
+
             conn.commit()
             conn.close()
 
