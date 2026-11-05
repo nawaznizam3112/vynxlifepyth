@@ -1,142 +1,115 @@
-
 import streamlit as st
 import sqlite3
 import hashlib
 import secrets
-import qrcode
 import io
-import re
 import os
+from datetime import datetime, date, timedelta
+
 import pandas as pd
 import plotly.express as px
-
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urlencode
+import qrcode
 
 
-# =========================================================
-# VYNX.LIFE RPM v1.0
-# SQLite version — no Supabase required
-# =========================================================
+# ============================================================
+# APP CONFIG
+# ============================================================
 
 st.set_page_config(
-    page_title="Vynx.life RPM",
-    page_icon="💙",
+    page_title="Vynx.life | Remote Patient Monitoring",
+    page_icon="🩺",
     layout="wide",
 )
 
-DB_FILE = "vynx_life.db"
+DB_PATH = "vynx_life.db"
 
-st.markdown("""
-<style>
-.stApp { background: #f4f7fb; }
-
-[data-testid="stSidebar"] {
-    background: #10233f;
-}
-
-[data-testid="stSidebar"] * {
-    color: white !important;
-}
-
-.hero {
-    background: linear-gradient(120deg,#10233f,#176b87);
-    color: white;
-    padding: 24px;
-    border-radius: 18px;
-    margin-bottom: 20px;
-}
-
-.hero h1 {
-    color: white;
-    margin: 0;
-}
-
-.hero p {
-    color: #dbeafe;
-    margin-bottom: 0;
-}
-
-div[data-testid="stMetric"] {
-    background: white;
-    border: 1px solid #e5eaf1;
-    padding: 15px;
-    border-radius: 14px;
-}
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    """
+    <style>
+    .main { background-color: #f7f9fc; }
+    .block-container { padding-top: 1.5rem; }
+    div[data-testid="stMetric"] {
+        background: white;
+        border: 1px solid #e8edf4;
+        padding: 15px;
+        border-radius: 12px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-# =========================================================
+# ============================================================
 # DATABASE
-# =========================================================
+# ============================================================
 
-def connect():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+def get_connection():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
-    conn = connect()
+    conn = get_connection()
     cur = conn.cursor()
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS doctors (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        clinic TEXT,
-        created_at TEXT
-    )
+        CREATE TABLE IF NOT EXISTS doctors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
     """)
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS patients (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        doctor_id INTEGER NOT NULL,
-        name TEXT NOT NULL,
-        patient_code TEXT NOT NULL,
-        age INTEGER,
-        sex TEXT,
-        phone TEXT,
-        conditions TEXT,
-        qr_token TEXT UNIQUE NOT NULL,
-        pin_hash TEXT NOT NULL,
-        active INTEGER DEFAULT 1,
-        created_at TEXT,
-        UNIQUE(doctor_id, patient_code)
-    )
+        CREATE TABLE IF NOT EXISTS patients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doctor_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            age INTEGER,
+            sex TEXT,
+            phone TEXT,
+            qr_token TEXT UNIQUE NOT NULL,
+            pin_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id)
+        )
     """)
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS readings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        patient_id INTEGER NOT NULL,
-        systolic INTEGER,
-        diastolic INTEGER,
-        pulse INTEGER,
-        spo2 REAL,
-        temperature REAL,
-        weight REAL,
-        glucose REAL,
-        notes TEXT,
-        recorded_at TEXT
-    )
+        CREATE TABLE IF NOT EXISTS vitals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            systolic INTEGER,
+            diastolic INTEGER,
+            pulse INTEGER,
+            spo2 REAL,
+            temperature REAL,
+            glucose REAL,
+            notes TEXT,
+            flagged INTEGER DEFAULT 0,
+            flag_reason TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (patient_id) REFERENCES patients(id)
+        )
     """)
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS alerts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        patient_id INTEGER NOT NULL,
-        reading_id INTEGER,
-        alert_type TEXT,
-        message TEXT,
-        severity TEXT,
-        reviewed INTEGER DEFAULT 0,
-        created_at TEXT
-    )
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doctor_id INTEGER NOT NULL,
+            patient_id INTEGER NOT NULL,
+            vital_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            is_read INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id),
+            FOREIGN KEY (patient_id) REFERENCES patients(id),
+            FOREIGN KEY (vital_id) REFERENCES vitals(id)
+        )
     """)
 
     conn.commit()
@@ -146,983 +119,942 @@ def init_db():
 init_db()
 
 
-# =========================================================
+# ============================================================
 # HELPERS
-# =========================================================
+# ============================================================
 
-def now():
-    return datetime.now(timezone.utc).isoformat()
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def hash_password(password):
+def hash_secret(value):
     salt = secrets.token_hex(16)
-
-    hashed = hashlib.pbkdf2_hmac(
+    digest = hashlib.pbkdf2_hmac(
         "sha256",
-        password.encode(),
-        salt.encode(),
-        200000,
+        value.encode("utf-8"),
+        salt.encode("utf-8"),
+        200_000,
     ).hex()
+    return f"{salt}${digest}"
 
-    return f"{salt}${hashed}"
 
-
-def check_password(password, stored):
+def verify_secret(value, stored_hash):
     try:
-        salt, expected = stored.split("$")
-
-        actual = hashlib.pbkdf2_hmac(
+        salt, digest = stored_hash.split("$", 1)
+        check = hashlib.pbkdf2_hmac(
             "sha256",
-            password.encode(),
-            salt.encode(),
-            200000,
+            value.encode("utf-8"),
+            salt.encode("utf-8"),
+            200_000,
         ).hex()
-
-        return secrets.compare_digest(actual, expected)
-
+        return secrets.compare_digest(check, digest)
     except Exception:
         return False
 
 
-def query(sql, params=()):
-    conn = connect()
-    result = conn.execute(sql, params).fetchall()
+def get_doctor(doctor_id):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM doctors WHERE id = ?",
+        (doctor_id,),
+    ).fetchone()
     conn.close()
-    return result
+    return row
 
 
-def execute(sql, params=()):
-    conn = connect()
-    cur = conn.execute(sql, params)
-    conn.commit()
-    last_id = cur.lastrowid
-    conn.close()
-    return last_id
-
-
-def get_patient(token):
-    rows = query(
-        "SELECT * FROM patients WHERE qr_token=? AND active=1",
+def get_patient_by_token(token):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM patients WHERE qr_token = ?",
         (token,),
-    )
+    ).fetchone()
+    conn.close()
+    return row
 
-    return dict(rows[0]) if rows else None
+
+def get_patient(patient_id):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM patients WHERE id = ?",
+        (patient_id,),
+    ).fetchone()
+    conn.close()
+    return row
 
 
 def get_doctor_patients(doctor_id):
-    rows = query(
-        "SELECT * FROM patients WHERE doctor_id=? ORDER BY created_at DESC",
-        (doctor_id,),
-    )
-
-    return [dict(row) for row in rows]
-
-
-def get_readings(patient_id, limit=500):
-    rows = query(
+    conn = get_connection()
+    rows = conn.execute(
         """
-        SELECT * FROM readings
-        WHERE patient_id=?
-        ORDER BY recorded_at DESC
-        LIMIT ?
+        SELECT * FROM patients
+        WHERE doctor_id = ?
+        ORDER BY name
         """,
-        (patient_id, limit),
-    )
+        (doctor_id,),
+    ).fetchall()
+    conn.close()
+    return rows
 
-    return [dict(row) for row in rows]
 
-
-def get_alerts(patient_id):
-    rows = query(
+def get_patient_vitals(patient_id):
+    conn = get_connection()
+    rows = conn.execute(
         """
-        SELECT * FROM alerts
-        WHERE patient_id=?
+        SELECT * FROM vitals
+        WHERE patient_id = ?
         ORDER BY created_at DESC
         """,
         (patient_id,),
-    )
+    ).fetchall()
+    conn.close()
+    return pd.DataFrame([dict(row) for row in rows])
 
-    return [dict(row) for row in rows]
+
+def assess_reading(systolic, diastolic, pulse, spo2, temperature, glucose):
+    """
+    Simple configurable demonstration thresholds.
+    These are not a diagnosis and should be reviewed by clinicians.
+    """
+    flags = []
+
+    if systolic is not None and systolic >= 180:
+        flags.append("Systolic BP ≥ 180")
+    if diastolic is not None and diastolic >= 120:
+        flags.append("Diastolic BP ≥ 120")
+    if systolic is not None and systolic < 90:
+        flags.append("Systolic BP < 90")
+
+    if pulse is not None and (pulse < 50 or pulse > 120):
+        flags.append("Pulse outside 50–120 bpm")
+
+    if spo2 is not None and spo2 < 92:
+        flags.append("SpO₂ < 92%")
+
+    if temperature is not None and temperature >= 38.0:
+        flags.append("Temperature ≥ 38°C")
+
+    if glucose is not None and glucose >= 250:
+        flags.append("Glucose ≥ 250 mg/dL")
+
+    return bool(flags), "; ".join(flags)
 
 
-def create_qr(url):
+def make_qr_image(url):
     qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
         box_size=8,
         border=3,
     )
-
     qr.add_data(url)
     qr.make(fit=True)
-
-    image = qr.make_image(
-        fill_color="#10233f",
-        back_color="white",
-    )
-
-    output = io.BytesIO()
-    image.save(output, format="PNG")
-
-    return output.getvalue()
+    return qr.make_image(fill_color="black", back_color="white")
 
 
-def make_alerts(reading):
-    alerts = []
-
-    # Illustrative prototype thresholds only.
-    # These are not diagnostic rules.
-
-    if reading["systolic"] >= 180:
-        alerts.append((
-            "High systolic BP",
-            "Systolic BP is 180 mmHg or higher.",
-            "urgent",
-        ))
-    elif reading["systolic"] >= 140:
-        alerts.append((
-            "Elevated systolic BP",
-            "Systolic BP is 140 mmHg or higher.",
-            "warning",
-        ))
-
-    if reading["diastolic"] >= 120:
-        alerts.append((
-            "High diastolic BP",
-            "Diastolic BP is 120 mmHg or higher.",
-            "urgent",
-        ))
-    elif reading["diastolic"] >= 90:
-        alerts.append((
-            "Elevated diastolic BP",
-            "Diastolic BP is 90 mmHg or higher.",
-            "warning",
-        ))
-
-    if reading["spo2"] < 90:
-        alerts.append((
-            "Low SpO₂",
-            "SpO₂ is below 90%.",
-            "urgent",
-        ))
-    elif reading["spo2"] < 94:
-        alerts.append((
-            "Reduced SpO₂",
-            "SpO₂ is below 94%.",
-            "warning",
-        ))
-
-    if reading["pulse"] < 50 or reading["pulse"] > 120:
-        alerts.append((
-            "Pulse outside default range",
-            "Pulse is below 50 or above 120 bpm.",
-            "warning",
-        ))
-
-    return alerts
-
-
-def save_reading(patient_id, reading):
-    reading_id = execute(
+def add_notification(doctor_id, patient_id, vital_id, message):
+    conn = get_connection()
+    conn.execute(
         """
-        INSERT INTO readings (
-            patient_id, systolic, diastolic, pulse, spo2,
-            temperature, weight, glucose, notes, recorded_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO notifications
+        (doctor_id, patient_id, vital_id, message, is_read, created_at)
+        VALUES (?, ?, ?, ?, 0, ?)
         """,
-        (
-            patient_id,
-            reading["systolic"],
-            reading["diastolic"],
-            reading["pulse"],
-            reading["spo2"],
-            reading["temperature"],
-            reading["weight"],
-            reading["glucose"],
-            reading["notes"],
-            now(),
-        ),
+        (doctor_id, patient_id, vital_id, message, now_text()),
     )
-
-    for alert_type, message, severity in make_alerts(reading):
-        execute(
-            """
-            INSERT INTO alerts (
-                patient_id, reading_id, alert_type,
-                message, severity, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                patient_id,
-                reading_id,
-                alert_type,
-                message,
-                severity,
-                now(),
-            ),
-        )
+    conn.commit()
+    conn.close()
 
 
-# =========================================================
-# SESSION
-# =========================================================
-
-if "doctor" not in st.session_state:
-    st.session_state.doctor = None
-
-if "patient" not in st.session_state:
-    st.session_state.patient = None
-
-if "new_patient" not in st.session_state:
-    st.session_state.new_patient = None
-
-
-# =========================================================
-# HEADER
-# =========================================================
-
-st.markdown("""
-<div class="hero">
-    <h1>💙 Vynx.life</h1>
-    <p>Remote Patient Monitoring & Vital Signs Tracking</p>
-</div>
-""", unsafe_allow_html=True)
+def get_notifications(doctor_id):
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT
+            n.*,
+            p.name AS patient_name
+        FROM notifications n
+        JOIN patients p ON p.id = n.patient_id
+        WHERE n.doctor_id = ?
+        ORDER BY n.created_at DESC
+        LIMIT 100
+        """,
+        (doctor_id,),
+    ).fetchall()
+    conn.close()
+    return rows
 
 
-# =========================================================
+def mark_notification_read(notification_id):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE notifications SET is_read = 1 WHERE id = ?",
+        (notification_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "doctor_id" not in st.session_state:
+    st.session_state.doctor_id = None
+
+if "doctor_name" not in st.session_state:
+    st.session_state.doctor_name = None
+
+
+# ============================================================
 # PATIENT PORTAL
-# =========================================================
+# ============================================================
 
-token = st.query_params.get("patient")
+query_params = st.query_params
+patient_token = query_params.get("patient", None)
 
-if token:
+if patient_token:
+    patient = get_patient_by_token(patient_token)
 
-    if st.session_state.patient:
-        patient = st.session_state.patient
+    st.title("🩺 Vynx.life")
+    st.subheader("Patient Vitals Portal")
 
-    else:
-        patient = get_patient(token)
+    if not patient:
+        st.error("This patient QR link is invalid or no longer available.")
+        st.stop()
 
-        if not patient:
-            st.error("Invalid or inactive patient QR link.")
-            st.stop()
+    st.write(f"Welcome, **{patient['name']}**")
 
-        st.subheader("Patient login")
+    if "patient_authenticated" not in st.session_state:
+        st.session_state.patient_authenticated = False
 
-        st.write(
-            f"Welcome, **{patient['name']}**. "
-            "Enter your 6-digit PIN."
-        )
+    if not st.session_state.patient_authenticated:
+        st.info("Enter the PIN provided by your doctor.")
 
-        pin = st.text_input(
-            "PIN",
-            type="password",
-            max_chars=6,
-        )
+        pin = st.text_input("Patient PIN", type="password")
 
-        if st.button("Access my health records", type="primary"):
-
-            if not re.fullmatch(r"\d{6}", pin or ""):
-                st.error("Enter a valid 6-digit PIN.")
-                st.stop()
-
-            if check_password(pin, patient["pin_hash"]):
-                st.session_state.patient = patient
+        if st.button("Unlock patient portal", type="primary"):
+            if verify_secret(pin, patient["pin_hash"]):
+                st.session_state.patient_authenticated = True
                 st.rerun()
-
             else:
                 st.error("Incorrect PIN.")
 
         st.stop()
 
-    patient = st.session_state.patient
+    st.success("Patient portal unlocked")
 
-    st.subheader(f"Hello, {patient['name']}")
+    st.markdown("### Submit your latest reading")
 
-    st.caption(
-        "Record your readings below. "
-        "Your linked doctor can view them."
-    )
+    with st.form("patient_vitals_form"):
+        col1, col2 = st.columns(2)
 
-    with st.form("patient_vitals"):
-
-        st.subheader("Record vital signs")
-
-        c1, c2 = st.columns(2)
-
-        with c1:
+        with col1:
             systolic = st.number_input(
                 "Systolic BP (mmHg)",
-                50, 300, 120,
+                min_value=0,
+                max_value=300,
+                value=0,
             )
-
-            diastolic = st.number_input(
-                "Diastolic BP (mmHg)",
-                30, 200, 80,
-            )
-
             pulse = st.number_input(
                 "Pulse (bpm)",
-                20, 250, 75,
+                min_value=0,
+                max_value=250,
+                value=0,
             )
-
-        with c2:
-            spo2 = st.number_input(
-                "SpO₂ (%)",
-                50.0, 100.0, 98.0,
-            )
-
             temperature = st.number_input(
                 "Temperature (°C)",
-                30.0, 45.0, 36.8,
+                min_value=0.0,
+                max_value=50.0,
+                value=0.0,
+                step=0.1,
             )
 
-            weight = st.number_input(
-                "Weight (kg)",
-                1.0, 400.0, 70.0,
+        with col2:
+            diastolic = st.number_input(
+                "Diastolic BP (mmHg)",
+                min_value=0,
+                max_value=200,
+                value=0,
+            )
+            spo2 = st.number_input(
+                "SpO₂ (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=0.0,
+                step=0.1,
+            )
+            glucose = st.number_input(
+                "Blood glucose (mg/dL)",
+                min_value=0.0,
+                max_value=1000.0,
+                value=0.0,
+                step=1.0,
             )
 
-        glucose = st.number_input(
-            "Glucose (mg/dL; 0 if not measured)",
-            0.0, 1000.0, 0.0,
+        notes = st.text_area(
+            "Notes (optional)",
+            placeholder="Symptoms, medication taken, measurement context...",
         )
 
-        notes = st.text_area("Notes")
-
         submitted = st.form_submit_button(
-            "Save readings",
+            "Submit readings",
             type="primary",
-            use_container_width=True,
         )
 
     if submitted:
+        # Zero is treated as not entered for optional values.
+        sys_value = int(systolic) if systolic > 0 else None
+        dia_value = int(diastolic) if diastolic > 0 else None
+        pulse_value = int(pulse) if pulse > 0 else None
+        spo2_value = float(spo2) if spo2 > 0 else None
+        temp_value = float(temperature) if temperature > 0 else None
+        glucose_value = float(glucose) if glucose > 0 else None
 
-        reading = {
-            "systolic": int(systolic),
-            "diastolic": int(diastolic),
-            "pulse": int(pulse),
-            "spo2": float(spo2),
-            "temperature": float(temperature),
-            "weight": float(weight),
-            "glucose": float(glucose) if glucose > 0 else None,
-            "notes": notes.strip() or None,
-        }
+        has_any_value = any(
+            value is not None
+            for value in [
+                sys_value,
+                dia_value,
+                pulse_value,
+                spo2_value,
+                temp_value,
+                glucose_value,
+            ]
+        )
 
-        save_reading(patient["id"], reading)
-
-        st.success("Your readings have been saved.")
-
-        if make_alerts(reading):
-            st.warning(
-                "One or more readings have been flagged. "
-                "Follow your clinician's instructions. "
-                "This is not an emergency monitoring service."
+        if not has_any_value:
+            st.warning("Please enter at least one vital reading.")
+        else:
+            flagged, reason = assess_reading(
+                sys_value,
+                dia_value,
+                pulse_value,
+                spo2_value,
+                temp_value,
+                glucose_value,
             )
 
-        st.rerun()
+            conn = get_connection()
+            cur = conn.cursor()
 
-    st.divider()
+            cur.execute(
+                """
+                INSERT INTO vitals (
+                    patient_id,
+                    systolic,
+                    diastolic,
+                    pulse,
+                    spo2,
+                    temperature,
+                    glucose,
+                    notes,
+                    flagged,
+                    flag_reason,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    patient["id"],
+                    sys_value,
+                    dia_value,
+                    pulse_value,
+                    spo2_value,
+                    temp_value,
+                    glucose_value,
+                    notes,
+                    int(flagged),
+                    reason,
+                    now_text(),
+                ),
+            )
 
-    st.subheader("My health history")
+            vital_id = cur.lastrowid
+            conn.commit()
+            conn.close()
 
-    readings = get_readings(patient["id"])
+            message = (
+                f"New vital reading submitted by {patient['name']}."
+            )
 
-    if readings:
-        df = pd.DataFrame(readings)
+            if flagged:
+                message += f" Flagged: {reason}"
 
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-        )
+            add_notification(
+                patient["doctor_id"],
+                patient["id"],
+                vital_id,
+                message,
+            )
 
-        df = df.sort_values("recorded_at")
+            st.success("Your readings have been submitted to your doctor.")
 
-        fig = px.line(
-            df,
-            x="recorded_at",
-            y=["systolic", "diastolic"],
-            markers=True,
-            title="Blood pressure trend",
-        )
+            if flagged:
+                st.warning(
+                    "One or more readings met the app's review thresholds. "
+                    "Your doctor can review them. If you feel seriously unwell, "
+                    "seek urgent medical care rather than waiting for an app alert."
+                )
 
-        st.plotly_chart(fig, use_container_width=True)
-
-    else:
-        st.info("No readings recorded yet.")
-
-    if st.button("Log out"):
-        st.session_state.patient = None
-        st.rerun()
+    st.markdown("---")
+    st.caption(
+        "Vynx.life is a monitoring and communication prototype. "
+        "It does not provide diagnosis or emergency monitoring."
+    )
 
     st.stop()
 
 
-# =========================================================
-# DOCTOR PORTAL
-# =========================================================
+# ============================================================
+# DOCTOR LOGIN / REGISTRATION
+# ============================================================
 
-st.sidebar.title("Vynx.life")
-st.sidebar.caption("Doctor control panel")
+st.title("🩺 Vynx.life")
+st.caption("Remote Patient Monitoring & Vitals Tracking")
 
-page = st.sidebar.radio(
-    "Navigation",
+if st.session_state.doctor_id is None:
+    login_tab, register_tab = st.tabs(
+        ["Doctor Login", "Create Doctor Account"]
+    )
+
+    with login_tab:
+        st.subheader("Doctor login")
+
+        email = st.text_input("Email address", key="login_email")
+        password = st.text_input(
+            "Password",
+            type="password",
+            key="login_password",
+        )
+
+        if st.button("Login", type="primary"):
+            conn = get_connection()
+            doctor = conn.execute(
+                "SELECT * FROM doctors WHERE email = ?",
+                (email.strip().lower(),),
+            ).fetchone()
+            conn.close()
+
+            if doctor and verify_secret(password, doctor["password_hash"]):
+                st.session_state.doctor_id = doctor["id"]
+                st.session_state.doctor_name = doctor["name"]
+                st.rerun()
+            else:
+                st.error("Invalid email or password.")
+
+    with register_tab:
+        st.subheader("Create a doctor account")
+
+        name = st.text_input("Doctor name", key="register_name")
+        email_new = st.text_input("Email address", key="register_email")
+        password_new = st.text_input(
+            "Create password",
+            type="password",
+            key="register_password",
+        )
+
+        if st.button("Create account"):
+            if not name.strip() or not email_new.strip() or not password_new:
+                st.warning("Please complete all fields.")
+            elif len(password_new) < 8:
+                st.warning("Use a password with at least 8 characters.")
+            else:
+                try:
+                    conn = get_connection()
+                    conn.execute(
+                        """
+                        INSERT INTO doctors
+                        (name, email, password_hash, created_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            name.strip(),
+                            email_new.strip().lower(),
+                            hash_secret(password_new),
+                            now_text(),
+                        ),
+                    )
+                    conn.commit()
+                    conn.close()
+
+                    st.success(
+                        "Doctor account created. You can now log in."
+                    )
+                except sqlite3.IntegrityError:
+                    st.error("An account with that email already exists.")
+
+    st.stop()
+
+
+# ============================================================
+# DOCTOR DASHBOARD
+# ============================================================
+
+doctor_id = st.session_state.doctor_id
+doctor_name = st.session_state.doctor_name
+
+with st.sidebar:
+    st.markdown("## Vynx.life")
+    st.write(f"Logged in: **Dr. {doctor_name}**")
+
+    if st.button("Refresh dashboard"):
+        st.rerun()
+
+    if st.button("Logout"):
+        st.session_state.doctor_id = None
+        st.session_state.doctor_name = None
+        st.rerun()
+
+st.header("Doctor Dashboard")
+
+patients = get_doctor_patients(doctor_id)
+notifications = get_notifications(doctor_id)
+
+unread_count = sum(1 for n in notifications if n["is_read"] == 0)
+
+total_readings = 0
+flagged_readings = 0
+
+for patient_row in patients:
+    patient_df = get_patient_vitals(patient_row["id"])
+    if not patient_df.empty:
+        total_readings += len(patient_df)
+        flagged_readings += int(patient_df["flagged"].fillna(0).sum())
+
+m1, m2, m3, m4 = st.columns(4)
+
+m1.metric("Patients", len(patients))
+m2.metric("Total readings", total_readings)
+m3.metric("Flagged readings", flagged_readings)
+m4.metric("Unread notifications", unread_count)
+
+dashboard_tab, patients_tab, notifications_tab, add_patient_tab = st.tabs(
     [
-        "Doctor Login",
-        "Doctor Registration",
-        "Dashboard",
-        "Register Patient",
-        "Patient Records",
-        "Alerts",
-    ],
+        "Overview",
+        "Patients & Charts",
+        "Notifications",
+        "Add Patient",
+    ]
 )
 
 
-# =========================================================
-# DOCTOR REGISTRATION
-# =========================================================
+# ============================================================
+# OVERVIEW TAB
+# ============================================================
 
-if page == "Doctor Registration":
+with dashboard_tab:
+    st.subheader("Recent patient activity")
 
-    st.subheader("Create doctor account")
+    activity_rows = []
 
-    with st.form("doctor_registration"):
+    for patient_row in patients:
+        patient_df = get_patient_vitals(patient_row["id"])
 
-        name = st.text_input("Doctor name")
-        email = st.text_input("Email")
-        clinic = st.text_input("Clinic name")
+        if not patient_df.empty:
+            latest = patient_df.iloc[0]
 
-        password = st.text_input(
-            "Password",
-            type="password",
-        )
-
-        confirm = st.text_input(
-            "Confirm password",
-            type="password",
-        )
-
-        submitted = st.form_submit_button(
-            "Create account",
-            type="primary",
-        )
-
-    if submitted:
-
-        if not name.strip() or not email.strip():
-            st.error("Name and email are required.")
-            st.stop()
-
-        if len(password) < 8:
-            st.error("Password must contain at least 8 characters.")
-            st.stop()
-
-        if password != confirm:
-            st.error("Passwords do not match.")
-            st.stop()
-
-        try:
-            execute(
-                """
-                INSERT INTO doctors (
-                    name, email, password_hash, clinic, created_at
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    name.strip(),
-                    email.strip().lower(),
-                    hash_password(password),
-                    clinic.strip(),
-                    now(),
-                ),
+            activity_rows.append(
+                {
+                    "Patient": patient_row["name"],
+                    "Latest reading": latest["created_at"],
+                    "BP": (
+                        f"{latest['systolic']}/{latest['diastolic']}"
+                        if pd.notna(latest["systolic"])
+                        and pd.notna(latest["diastolic"])
+                        else "—"
+                    ),
+                    "Pulse": (
+                        latest["pulse"]
+                        if pd.notna(latest["pulse"])
+                        else "—"
+                    ),
+                    "SpO₂": (
+                        latest["spo2"]
+                        if pd.notna(latest["spo2"])
+                        else "—"
+                    ),
+                    "Flagged": (
+                        "Review"
+                        if int(latest["flagged"] or 0) == 1
+                        else "No flag"
+                    ),
+                }
             )
 
-            st.success(
-                "Doctor account created. "
-                "You can now log in."
-            )
-
-        except sqlite3.IntegrityError:
-            st.error("This email is already registered.")
-
-    st.stop()
-
-
-# =========================================================
-# DOCTOR LOGIN
-# =========================================================
-
-if page == "Doctor Login":
-
-    st.subheader("Doctor login")
-
-    with st.form("doctor_login"):
-
-        email = st.text_input("Email")
-
-        password = st.text_input(
-            "Password",
-            type="password",
-        )
-
-        submitted = st.form_submit_button(
-            "Sign in",
-            type="primary",
-        )
-
-    if submitted:
-
-        doctors = query(
-            "SELECT * FROM doctors WHERE email=?",
-            (email.strip().lower(),),
-        )
-
-        if doctors and check_password(
-            password,
-            doctors[0]["password_hash"],
-        ):
-
-            st.session_state.doctor = dict(doctors[0])
-
-            st.success("Login successful.")
-            st.rerun()
-
-        else:
-            st.error("Incorrect email or password.")
-
-    st.info(
-        "New doctor? Select Doctor Registration "
-        "from the sidebar."
-    )
-
-    st.stop()
-
-
-# =========================================================
-# AUTHENTICATION
-# =========================================================
-
-doctor = st.session_state.doctor
-
-if not doctor:
-    st.warning("Please sign in first.")
-    st.stop()
-
-doctor_id = doctor["id"]
-
-st.sidebar.success(f"Doctor: {doctor['name']}")
-
-if st.sidebar.button("Sign out"):
-    st.session_state.doctor = None
-    st.rerun()
-
-patients = get_doctor_patients(doctor_id)
-
-
-# =========================================================
-# DASHBOARD
-# =========================================================
-
-if page == "Dashboard":
-
-    st.subheader("Doctor dashboard")
-
-    total_readings = 0
-    latest_readings = []
-
-    for patient in patients:
-
-        readings = get_readings(patient["id"], limit=1)
-
-        if readings:
-            latest = readings[0]
-            latest["patient_name"] = patient["name"]
-            latest["patient_code"] = patient["patient_code"]
-
-            latest_readings.append(latest)
-            total_readings += 1
-
-    alert_count = 0
-
-    for patient in patients:
-        alert_count += len([
-            a for a in get_alerts(patient["id"])
-            if not a["reviewed"]
-        ])
-
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric("Registered patients", len(patients))
-    c2.metric("Patients with readings", total_readings)
-    c3.metric("Unreviewed alerts", alert_count)
-
-    st.divider()
-
-    st.subheader("Latest readings")
-
-    if latest_readings:
-
-        df = pd.DataFrame(latest_readings)
-
-        columns = [
-            "patient_name",
-            "patient_code",
-            "systolic",
-            "diastolic",
-            "pulse",
-            "spo2",
-            "temperature",
-            "recorded_at",
-        ]
-
+    if activity_rows:
         st.dataframe(
-            df[columns],
+            pd.DataFrame(activity_rows),
             use_container_width=True,
             hide_index=True,
         )
-
     else:
-        st.info("No readings have been submitted yet.")
+        st.info("No readings submitted yet.")
 
-    st.divider()
+    st.markdown("### Readings requiring review")
 
-    st.subheader("Registered patients")
+    flagged_rows = []
 
-    if patients:
+    for patient_row in patients:
+        patient_df = get_patient_vitals(patient_row["id"])
 
-        df = pd.DataFrame(patients)
+        if not patient_df.empty:
+            flagged_df = patient_df[
+                patient_df["flagged"].fillna(0).astype(int) == 1
+            ]
 
+            for _, row in flagged_df.iterrows():
+                flagged_rows.append(
+                    {
+                        "Patient": patient_row["name"],
+                        "Date/time": row["created_at"],
+                        "Reason": row["flag_reason"],
+                    }
+                )
+
+    if flagged_rows:
         st.dataframe(
-            df[
-                [
-                    "name",
-                    "patient_code",
-                    "age",
-                    "sex",
-                    "phone",
-                ]
-            ],
+            pd.DataFrame(flagged_rows),
             use_container_width=True,
             hide_index=True,
         )
+    else:
+        st.success("No flagged readings currently recorded.")
 
 
-# =========================================================
-# REGISTER PATIENT
-# =========================================================
+# ============================================================
+# PATIENTS & CHARTS TAB
+# ============================================================
 
-elif page == "Register Patient":
+with patients_tab:
+    st.subheader("Patient history and vital trends")
 
-    st.subheader("Register patient")
+    if not patients:
+        st.info("Add a patient to start tracking readings.")
+    else:
+        patient_options = {
+            f"{p['name']} (Patient ID: {p['id']})": p["id"]
+            for p in patients
+        }
 
-    with st.form("register_patient"):
-
-        name = st.text_input("Patient name")
-        patient_code = st.text_input("Patient ID")
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            age = st.number_input(
-                "Age",
-                0, 120, 40,
-            )
-
-            sex = st.selectbox(
-                "Sex",
-                ["Not specified", "Male", "Female", "Other"],
-            )
-
-        with c2:
-            phone = st.text_input("Phone")
-
-            conditions = st.text_area(
-                "Relevant conditions",
-            )
-
-        pin = st.text_input(
-            "Create 6-digit patient PIN",
-            type="password",
-            max_chars=6,
+        selected_patient_label = st.selectbox(
+            "Select patient",
+            list(patient_options.keys()),
         )
 
-        confirm_pin = st.text_input(
-            "Confirm PIN",
-            type="password",
-            max_chars=6,
+        selected_patient_id = patient_options[selected_patient_label]
+        selected_patient = get_patient(selected_patient_id)
+
+        df = get_patient_vitals(selected_patient_id)
+
+        st.markdown(
+            f"### {selected_patient['name']}"
         )
 
-        submitted = st.form_submit_button(
-            "Register patient",
+        if df.empty:
+            st.info("No readings available for this patient.")
+        else:
+            df["created_at"] = pd.to_datetime(
+                df["created_at"],
+                errors="coerce",
+            )
+
+            df = df.sort_values("created_at")
+
+            chart_metric = st.selectbox(
+                "Choose vital for chart",
+                [
+                    "Blood Pressure",
+                    "Pulse",
+                    "SpO₂",
+                    "Temperature",
+                    "Glucose",
+                ],
+            )
+
+            if chart_metric == "Blood Pressure":
+                chart_df = df[
+                    df["systolic"].notna()
+                    | df["diastolic"].notna()
+                ]
+
+                if not chart_df.empty:
+                    fig = px.line(
+                        chart_df,
+                        x="created_at",
+                        y=["systolic", "diastolic"],
+                        markers=True,
+                        title="Blood pressure trend",
+                        labels={
+                            "created_at": "Date/time",
+                            "value": "mmHg",
+                            "variable": "Measurement",
+                        },
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No blood pressure readings recorded.")
+
+            elif chart_metric == "Pulse":
+                chart_df = df[df["pulse"].notna()]
+
+                if not chart_df.empty:
+                    fig = px.line(
+                        chart_df,
+                        x="created_at",
+                        y="pulse",
+                        markers=True,
+                        title="Pulse trend",
+                        labels={
+                            "created_at": "Date/time",
+                            "pulse": "bpm",
+                        },
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No pulse readings recorded.")
+
+            elif chart_metric == "SpO₂":
+                chart_df = df[df["spo2"].notna()]
+
+                if not chart_df.empty:
+                    fig = px.line(
+                        chart_df,
+                        x="created_at",
+                        y="spo2",
+                        markers=True,
+                        title="SpO₂ trend",
+                        labels={
+                            "created_at": "Date/time",
+                            "spo2": "%",
+                        },
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No SpO₂ readings recorded.")
+
+            elif chart_metric == "Temperature":
+                chart_df = df[df["temperature"].notna()]
+
+                if not chart_df.empty:
+                    fig = px.line(
+                        chart_df,
+                        x="created_at",
+                        y="temperature",
+                        markers=True,
+                        title="Temperature trend",
+                        labels={
+                            "created_at": "Date/time",
+                            "temperature": "°C",
+                        },
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No temperature readings recorded.")
+
+            elif chart_metric == "Glucose":
+                chart_df = df[df["glucose"].notna()]
+
+                if not chart_df.empty:
+                    fig = px.line(
+                        chart_df,
+                        x="created_at",
+                        y="glucose",
+                        markers=True,
+                        title="Blood glucose trend",
+                        labels={
+                            "created_at": "Date/time",
+                            "glucose": "mg/dL",
+                        },
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No glucose readings recorded.")
+
+            st.markdown("### Reading history")
+
+            display_df = df.copy()
+            display_df["created_at"] = display_df["created_at"].dt.strftime(
+                "%Y-%m-%d %H:%M"
+            )
+
+            st.dataframe(
+                display_df[
+                    [
+                        "created_at",
+                        "systolic",
+                        "diastolic",
+                        "pulse",
+                        "spo2",
+                        "temperature",
+                        "glucose",
+                        "notes",
+                        "flagged",
+                        "flag_reason",
+                    ]
+                ].sort_values("created_at", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            csv = display_df.to_csv(index=False).encode("utf-8")
+
+            st.download_button(
+                "Download patient history as CSV",
+                data=csv,
+                file_name=f"vynx_patient_{selected_patient_id}_history.csv",
+                mime="text/csv",
+            )
+
+
+# ============================================================
+# NOTIFICATIONS TAB
+# ============================================================
+
+with notifications_tab:
+    st.subheader("Doctor notifications")
+
+    if not notifications:
+        st.info("No notifications yet.")
+    else:
+        for notification in notifications:
+            with st.container(border=True):
+                col1, col2 = st.columns([5, 1])
+
+                with col1:
+                    if notification["is_read"] == 0:
+                        st.markdown("🔵 **New notification**")
+                    else:
+                        st.markdown("Notification")
+
+                    st.write(notification["message"])
+                    st.caption(notification["created_at"])
+
+                with col2:
+                    if notification["is_read"] == 0:
+                        if st.button(
+                            "Mark read",
+                            key=f"read_{notification['id']}",
+                        ):
+                            mark_notification_read(notification["id"])
+                            st.rerun()
+
+
+# ============================================================
+# ADD PATIENT TAB
+# ============================================================
+
+with add_patient_tab:
+    st.subheader("Register a patient")
+
+    with st.form("add_patient_form"):
+        patient_name = st.text_input("Patient full name")
+        patient_age = st.number_input(
+            "Age",
+            min_value=0,
+            max_value=120,
+            value=40,
+        )
+        patient_sex = st.selectbox(
+            "Sex",
+            ["Prefer not to say", "Female", "Male", "Other"],
+        )
+        patient_phone = st.text_input("Phone number (optional)")
+        patient_pin = st.text_input(
+            "Create patient PIN",
+            type="password",
+            help="Share this PIN securely with the patient.",
+        )
+
+        create_patient = st.form_submit_button(
+            "Create patient and QR code",
             type="primary",
         )
 
-    if submitted:
+    if create_patient:
+        if not patient_name.strip():
+            st.warning("Enter the patient's name.")
+        elif len(patient_pin) < 4:
+            st.warning("Patient PIN must be at least 4 characters.")
+        else:
+            token = secrets.token_urlsafe(24)
 
-        if not name.strip() or not patient_code.strip():
-            st.error("Patient name and ID are required.")
-            st.stop()
-
-        if not re.fullmatch(r"\d{6}", pin or ""):
-            st.error("PIN must contain exactly 6 digits.")
-            st.stop()
-
-        if pin != confirm_pin:
-            st.error("PINs do not match.")
-            st.stop()
-
-        token = secrets.token_urlsafe(32)
-
-        try:
-
-            patient_id = execute(
+            conn = get_connection()
+            conn.execute(
                 """
                 INSERT INTO patients (
-                    doctor_id, name, patient_code, age,
-                    sex, phone, conditions, qr_token,
-                    pin_hash, created_at
+                    doctor_id,
+                    name,
+                    age,
+                    sex,
+                    phone,
+                    qr_token,
+                    pin_hash,
+                    created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     doctor_id,
-                    name.strip(),
-                    patient_code.strip(),
-                    int(age),
-                    sex,
-                    phone.strip(),
-                    conditions.strip(),
+                    patient_name.strip(),
+                    int(patient_age),
+                    patient_sex,
+                    patient_phone.strip(),
                     token,
-                    hash_password(pin),
-                    now(),
+                    hash_secret(patient_pin),
+                    now_text(),
                 ),
             )
+            conn.commit()
+            conn.close()
 
-            st.session_state.new_patient = {
-                "id": patient_id,
-                "name": name.strip(),
-                "token": token,
-            }
-
-            st.success("Patient registered.")
-
-        except sqlite3.IntegrityError:
-            st.error(
-                "Patient ID already exists for this doctor."
+            st.success("Patient registered successfully.")
+            st.info(
+                "Set the deployed app URL below to create the patient's QR code."
             )
 
-    new_patient = st.session_state.new_patient
+            st.session_state["new_patient_token"] = token
+            st.session_state["new_patient_name"] = patient_name.strip()
 
-    if new_patient:
-
-        st.divider()
-
-        st.subheader("Patient QR code")
-
-        st.write(f"Patient: **{new_patient['name']}**")
-
+    if "new_patient_token" in st.session_state:
         app_url = st.text_input(
-            "Your deployed app URL",
-            value="",
-            placeholder="https://your-app.streamlit.app",
+            "Your deployed Streamlit app URL",
+            placeholder="https://your-app-name.streamlit.app",
         )
 
         if app_url.strip():
-
             patient_url = (
-                app_url.rstrip("/")
-                + "/?"
-                + urlencode({"patient": new_patient["token"]})
-            )
-
-            qr_bytes = create_qr(patient_url)
-
-            st.image(qr_bytes, width=260)
-
-            st.download_button(
-                "Download QR code",
-                data=qr_bytes,
-                file_name="vynx_patient_qr.png",
-                mime="image/png",
+                app_url.strip().rstrip("/")
+                + "?patient="
+                + st.session_state["new_patient_token"]
             )
 
             st.code(patient_url)
 
-        st.warning(
-            "Keep the QR code private. "
-            "It is linked to this patient's account."
-        )
+            qr_image = make_qr_image(patient_url)
 
-
-# =========================================================
-# PATIENT RECORDS
-# =========================================================
-
-elif page == "Patient Records":
-
-    st.subheader("Patient records")
-
-    if not patients:
-        st.info("No patients registered.")
-        st.stop()
-
-    options = {
-        f"{p['name']} ({p['patient_code']})": p
-        for p in patients
-    }
-
-    selected = st.selectbox(
-        "Select patient",
-        list(options.keys()),
-    )
-
-    patient = options[selected]
-
-    readings = get_readings(patient["id"])
-
-    if readings:
-
-        df = pd.DataFrame(readings)
-
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        metric = st.selectbox(
-            "Vital sign trend",
-            [
-                "systolic",
-                "diastolic",
-                "pulse",
-                "spo2",
-                "temperature",
-                "weight",
-                "glucose",
-            ],
-        )
-
-        chart_df = df.dropna(
-            subset=[metric]
-        ).sort_values("recorded_at")
-
-        if not chart_df.empty:
-
-            fig = px.line(
-                chart_df,
-                x="recorded_at",
-                y=metric,
-                markers=True,
-                title=f"{metric.title()} trend",
+            st.image(
+                qr_image,
+                caption=f"Patient QR code — {st.session_state['new_patient_name']}",
+                width=250,
             )
 
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
+            buffer = io.BytesIO()
+            qr_image.save(buffer, format="PNG")
+
+            st.download_button(
+                "Download patient QR code",
+                data=buffer.getvalue(),
+                file_name="vynx_patient_qr.png",
+                mime="image/png",
             )
 
-        st.download_button(
-            "Download CSV report",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{patient['patient_code']}_report.csv",
-            mime="text/csv",
-        )
 
-    else:
-        st.info("No readings recorded.")
-
-
-# =========================================================
-# ALERTS
-# =========================================================
-
-elif page == "Alerts":
-
-    st.subheader("Patient alerts")
-
-    all_alerts = []
-
-    for patient in patients:
-
-        for alert in get_alerts(patient["id"]):
-
-            alert["patient_name"] = patient["name"]
-            alert["patient_code"] = patient["patient_code"]
-
-            all_alerts.append(alert)
-
-    if not all_alerts:
-        st.success("No alerts recorded.")
-        st.stop()
-
-    df = pd.DataFrame(all_alerts)
-
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    pending = [
-        a for a in all_alerts
-        if not a["reviewed"]
-    ]
-
-    if pending:
-
-        options = {
-            f"{a['patient_name']} | {a['alert_type']} | {a['created_at']}": a
-            for a in pending
-        }
-
-        selected = st.selectbox(
-            "Select alert to review",
-            list(options.keys()),
-        )
-
-        alert = options[selected]
-
-        if st.button(
-            "Mark as reviewed",
-            type="primary",
-        ):
-
-            # Confirm alert belongs to a patient
-            # linked to the current doctor.
-            owned_ids = {
-                p["id"] for p in patients
-            }
-
-            if alert["patient_id"] not in owned_ids:
-                st.error("Unauthorized.")
-                st.stop()
-
-            execute(
-                "UPDATE alerts SET reviewed=1 WHERE id=?",
-                (alert["id"],),
-            )
-
-            st.success("Alert reviewed.")
-            st.rerun()
-
-    else:
-        st.info("All alerts have been reviewed.")
-
-
-# =========================================================
+# ============================================================
 # FOOTER
-# =========================================================
+# ============================================================
 
-st.divider()
-
+st.markdown("---")
 st.caption(
-    "Vynx.life RPM v1.0 | SQLite prototype"
-)
-
-st.caption(
-    "This software is not an emergency service and does "
-    "not diagnose or provide treatment advice. "
-    "Readings and alerts require clinical review."
+    "Vynx.life prototype | Patient readings are for clinician review. "
+    "This application is not an emergency service."
 )
