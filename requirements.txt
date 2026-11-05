@@ -1,0 +1,5 @@
+
+streamlit
+qrcode[pil]
+pandas
+plotly
